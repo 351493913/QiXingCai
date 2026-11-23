@@ -1,0 +1,114 @@
+name: 七星彩预测（每周一/三/六）
+
+# 北京时间 周一、周三、周六 02:00
+# GitHub Actions 的 cron 使用 UTC，北京 = UTC+8，因此为前一天 18:00 UTC
+#   周一 02:00 CST -> 周日 18:00 UTC
+#   周三 02:00 CST -> 周二 18:00 UTC
+#   周六 02:00 CST -> 周五 18:00 UTC
+on:
+  schedule:
+    - cron: "0 18 * * 0,2,5"
+  workflow_dispatch: {}   # 支持在 Actions 页面手动触发，便于验证
+
+# 需要写权限才能把结果提交回仓库
+permissions:
+  contents: write
+
+# 防止上一次还没跑完又叠加一次
+concurrency:
+  group: qxc-weekly
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUNBUFFERED: "1"
+      TZ: Asia/Shanghai
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ---------- 第一步：抓取开奖结果 ----------
+      # 抓取源偶发超时/限流，这里带重试；脚本本身不做任何改动
+      - name: 第一步 · 抓取开奖结果 get_qxc_results.py
+        run: |
+          set -o pipefail
+          for i in 1 2 3 4 5; do
+            echo "::group::尝试第 $i 次"
+            if python get_qxc_results.py 2>&1 | tee fetch.log; then
+              echo "::endgroup::"
+              if [ -s qxc_last100.csv ]; then
+                echo "抓取成功，CSV 行数: $(($(wc -l < qxc_last100.csv) - 1))"
+                exit 0
+              fi
+              echo "CSV 为空，重试"
+            else
+              echo "::endgroup::"
+              echo "第 $i 次执行失败"
+            fi
+            sleep $((i * 15))
+          done
+          echo "重试全部失败"
+          exit 1
+
+      # ---------- 第二步：依赖上一步产物做预测 ----------
+      - name: 第二步 · 五行推算 predict_wuxing_v3.py
+        run: |
+          set -o pipefail
+          python predict_wuxing_v3.py 2>&1 | tee predict.log
+          # 结果归档，方便在仓库里直接看
+          STAMP=$(date +%Y-%m-%d)
+          {
+            echo "# 七星彩五行推算 · ${STAMP}（北京时间 $(date +%H:%M)）"
+            echo ""
+            echo '```'
+            cat predict.log
+            echo '```'
+          } > "output/predict_${STAMP}.txt"
+
+      # ---------- 归档产物 ----------
+      - name: 上传运行产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qxc-result-${{ github.run_number }}
+          path: |
+            qxc_last100.csv
+            output/
+            fetch.log
+            predict.log
+          if-no-files-found: warn
+          retention-days: 90
+
+      # ---------- 把结果回写仓库 ----------
+      # 每次运行留下 CSV 与预测文本，既方便回看，也让仓库保持活跃
+      - name: 提交结果回仓库
+        if: success()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add qxc_last100.csv output/
+          if git diff --staged --quiet; then
+            echo "没有变化，跳过提交"
+            exit 0
+          fi
+          git commit -m "chore: 更新七星彩数据与预测 $(date +%Y-%m-%d)"
+          # 并发/远端有新提交时先变基再推
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+          git push
